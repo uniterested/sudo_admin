@@ -1008,6 +1008,128 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Rate limiting constants
+DAILY_CALL_LIMIT = 2
+DAILY_SMS_LIMIT = 2
+
+def get_today_date_string():
+    """Get today's date as YYYY-MM-DD string"""
+    from datetime import datetime
+    import pytz
+    ist = pytz.timezone('Asia/Kolkata')
+    return datetime.now(ist).strftime('%Y-%m-%d')
+
+def check_daily_limit(qr_id, action_type):
+    """
+    Check if daily limit has been reached for a specific action type.
+    
+    Args:
+        qr_id: The QR code ID
+        action_type: 'call', 'push', or 'sms'
+    
+    Returns:
+        tuple: (is_allowed: bool, current_count: int, limit: int)
+    """
+    try:
+        # Push notifications are currently unlimited
+        if action_type == 'push':
+            return True, 0, None
+
+        today = get_today_date_string()
+        
+        # Get or create daily usage document
+        usage_ref = db.collection('daily_usage').document(f"{qr_id}_{today}")
+        usage_doc = usage_ref.get()
+        
+        # Determine limit and count field based on action type
+        if action_type == 'call':
+            limit = DAILY_CALL_LIMIT
+            count_field = 'calls_count'
+        elif action_type == 'sms':
+            limit = DAILY_SMS_LIMIT
+            count_field = 'sms_count'
+        else:
+            # Unknown action type, allow by default
+            return True, 0, None
+        
+        if not usage_doc.exists:
+            # No usage today, allow the action
+            return True, 0, limit
+        
+        usage_data = usage_doc.to_dict()
+        current_count = usage_data.get(count_field, 0)
+        
+        # Check if limit reached
+        is_allowed = current_count < limit
+        
+        return is_allowed, current_count, limit
+        
+    except Exception as e:
+        logger.error(f"Error checking daily limit: {str(e)}")
+        # On error, allow the action (fail open)
+        if action_type == 'call':
+            limit = DAILY_CALL_LIMIT
+        elif action_type == 'sms':
+            limit = DAILY_SMS_LIMIT
+        else:
+            limit = None
+        return True, 0, limit
+
+def increment_daily_count(qr_id, action_type):
+    """
+    Increment the daily count for a specific action type.
+    
+    Args:
+        qr_id: The QR code ID
+        action_type: 'call', 'push', or 'sms'
+    """
+    try:
+        # Push notifications are currently unlimited
+        if action_type == 'push':
+            return
+
+        today = get_today_date_string()
+        
+        # Get or create daily usage document
+        usage_ref = db.collection('daily_usage').document(f"{qr_id}_{today}")
+        usage_doc = usage_ref.get()
+        
+        # Determine count field based on action type
+        if action_type == 'call':
+            count_field = 'calls_count'
+        elif action_type == 'sms':
+            count_field = 'sms_count'
+        else:
+            return
+        
+        if not usage_doc.exists:
+            # Create new document
+            from datetime import datetime
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            usage_ref.set({
+                'qr_id': qr_id,
+                'date': today,
+                'calls_count': 1 if action_type == 'call' else 0,
+                'sms_count': 1 if action_type == 'sms' else 0,
+                'last_updated': datetime.now(ist)
+            })
+        else:
+            # Increment existing count
+            from datetime import datetime
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            usage_data = usage_doc.to_dict()
+            current_count = usage_data.get(count_field, 0)
+            update_data = {
+                count_field: current_count + 1,
+                'last_updated': datetime.now(ist)
+            }
+            usage_ref.update(update_data)
+            
+    except Exception as e:
+        logger.error(f"Error incrementing daily count: {str(e)}")
+
 def get_twilio_error_message(twilio_exception):
     """
     Convert Twilio error codes to user-friendly messages
@@ -1075,7 +1197,7 @@ def send_notification(request, qr_id):
                 
                 # Handle different notification methods
                 if notification_method == 'push':
-                    # Existing push notification code
+                    # Push notifications currently have no daily limit
                     fcm_token = user_data.get('fcmToken')
                     
                     if not fcm_token:
@@ -1149,6 +1271,15 @@ def send_notification(request, qr_id):
                             })
 
                         if notification_method == 'sms':
+                            # Check daily limit for SMS
+                            is_allowed, current_count, limit = check_daily_limit(qr_id, 'sms')
+                            
+                            if not is_allowed:
+                                return JsonResponse({
+                                    'status': 'error',
+                                    'message': f'Daily SMS limit reached. You have used {current_count} out of {limit} SMS messages today. Please try again tomorrow.'
+                                })
+                            
                             # Send SMS
                             message = twilio_client.messages.create(
                                 body=f"Vehicle Alert: {reason}\n\nFrom: {user_phone or 'Anonymous'}",
@@ -1156,12 +1287,23 @@ def send_notification(request, qr_id):
                                 to=owner_phone
                             )
                             logger.info(f"SMS sent successfully: {message.sid}")
+                            # Increment daily count after successful SMS
+                            increment_daily_count(qr_id, 'sms')
                             return JsonResponse({
                                 'status': 'success',
                                 'message': 'SMS sent successfully to the vehicle owner.'
                             })
                         
                         elif notification_method == 'call':
+                            # Check daily limit for calls
+                            is_allowed, current_count, limit = check_daily_limit(qr_id, 'call')
+                            
+                            if not is_allowed:
+                                return JsonResponse({
+                                    'status': 'error',
+                                    'message': f'Daily call limit reached. You have used {current_count} out of {limit} calls today. Please try again tomorrow.'
+                                })
+                            
                             # Make phone call
                             call = twilio_client.calls.create(
                                 twiml=f'<Response><Say>Hello, this is an important message about your vehicle. {reason}. The person trying to reach you provided this number: {user_phone or "not provided"}. Thank you from Sudo.</Say></Response>',
@@ -1169,6 +1311,8 @@ def send_notification(request, qr_id):
                                 to=owner_phone
                             )
                             logger.info(f"Call initiated successfully: {call.sid}")
+                            # Increment daily count after successful call
+                            increment_daily_count(qr_id, 'call')
                             return JsonResponse({
                                 'status': 'success',
                                 'message': 'Phone call initiated successfully to the vehicle owner.'
