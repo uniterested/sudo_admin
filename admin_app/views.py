@@ -1010,7 +1010,6 @@ logger = logging.getLogger(__name__)
 
 # Rate limiting constants
 DAILY_CALL_LIMIT = 2
-DAILY_PUSH_NOTIFICATION_LIMIT = 2
 DAILY_SMS_LIMIT = 2
 
 def get_today_date_string():
@@ -1032,6 +1031,10 @@ def check_daily_limit(qr_id, action_type):
         tuple: (is_allowed: bool, current_count: int, limit: int)
     """
     try:
+        # Push notifications are currently unlimited
+        if action_type == 'push':
+            return True, 0, None
+
         today = get_today_date_string()
         
         # Get or create daily usage document
@@ -1045,13 +1048,9 @@ def check_daily_limit(qr_id, action_type):
         elif action_type == 'sms':
             limit = DAILY_SMS_LIMIT
             count_field = 'sms_count'
-        elif action_type == 'push':
-            limit = DAILY_PUSH_NOTIFICATION_LIMIT
-            count_field = 'push_notifications_count'
         else:
-            # Default to push notification limit for unknown types
-            limit = DAILY_PUSH_NOTIFICATION_LIMIT
-            count_field = 'push_notifications_count'
+            # Unknown action type, allow by default
+            return True, 0, None
         
         if not usage_doc.exists:
             # No usage today, allow the action
@@ -1068,7 +1067,12 @@ def check_daily_limit(qr_id, action_type):
     except Exception as e:
         logger.error(f"Error checking daily limit: {str(e)}")
         # On error, allow the action (fail open)
-        limit = DAILY_CALL_LIMIT if action_type == 'call' else (DAILY_SMS_LIMIT if action_type == 'sms' else DAILY_PUSH_NOTIFICATION_LIMIT)
+        if action_type == 'call':
+            limit = DAILY_CALL_LIMIT
+        elif action_type == 'sms':
+            limit = DAILY_SMS_LIMIT
+        else:
+            limit = None
         return True, 0, limit
 
 def increment_daily_count(qr_id, action_type):
@@ -1080,6 +1084,10 @@ def increment_daily_count(qr_id, action_type):
         action_type: 'call', 'push', or 'sms'
     """
     try:
+        # Push notifications are currently unlimited
+        if action_type == 'push':
+            return
+
         today = get_today_date_string()
         
         # Get or create daily usage document
@@ -1091,11 +1099,8 @@ def increment_daily_count(qr_id, action_type):
             count_field = 'calls_count'
         elif action_type == 'sms':
             count_field = 'sms_count'
-        elif action_type == 'push':
-            count_field = 'push_notifications_count'
         else:
-            # Default to push notifications for unknown types
-            count_field = 'push_notifications_count'
+            return
         
         if not usage_doc.exists:
             # Create new document
@@ -1106,7 +1111,6 @@ def increment_daily_count(qr_id, action_type):
                 'qr_id': qr_id,
                 'date': today,
                 'calls_count': 1 if action_type == 'call' else 0,
-                'push_notifications_count': 1 if action_type == 'push' else 0,
                 'sms_count': 1 if action_type == 'sms' else 0,
                 'last_updated': datetime.now(ist)
             })
@@ -1193,16 +1197,7 @@ def send_notification(request, qr_id):
                 
                 # Handle different notification methods
                 if notification_method == 'push':
-                    # Check daily limit for push notifications
-                    is_allowed, current_count, limit = check_daily_limit(qr_id, 'push')
-                    
-                    if not is_allowed:
-                        return JsonResponse({
-                            'status': 'error', 
-                            'message': f'Daily push notification limit reached. You have used {current_count} out of {limit} push notifications today. Please try again tomorrow.'
-                        })
-                    
-                    # Existing push notification code
+                    # Push notifications currently have no daily limit
                     fcm_token = user_data.get('fcmToken')
                     
                     if not fcm_token:
@@ -1226,8 +1221,6 @@ def send_notification(request, qr_id):
 
                     try:
                         response = messaging.send(message)
-                        # Increment daily count after successful push notification
-                        increment_daily_count(qr_id, 'push')
                         return JsonResponse({
                             'status': 'success', 
                             'message': 'We have sent your message to the vehicle owner.'
